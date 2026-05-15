@@ -17,9 +17,9 @@ TOOLS = [
                 "max_depth": {
                     "type": "integer",
                     "description": "Maximum directory depth to traverse from path.",
-                    "default": 2,
+                    "default": 1,
                     "minimum": 1,
-                    "maximum": 5,
+                    "maximum": 3,
                 },
             },
             "required": [],

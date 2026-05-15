@@ -2,79 +2,91 @@ from __future__ import annotations
 
 import json
 import time
+import uuid
 from typing import Any
 
 from django.conf import settings
 from django.utils import timezone
 
+from agent.citations import persist_citations_from_answer
+from agent.providers.base import CompletionResult, ToolCallRequest, ToolUseFailedError
+from agent.providers.chain import ChainedLLMProvider
+from agent.providers.openai_compat import parse_failed_tool_from_text
 from agent.tool_dispatcher import execute_tool
-from agent.tool_schemas import TOOLS
+from agent.tools.db_tools import get_previous_findings
 from research.models import ResearchSession, ToolCall
 
 
-MAX_TOOL_CALLS = 25
+MAX_TOOL_CALLS = 15
 MAX_WALL_CLOCK_SECONDS = 60
-MAX_TOOL_RESULT_CHARS = 8000
+MAX_TOOL_RESULT_CHARS = 3000
+MAX_COMPLETION_RETRIES = 2
 
 
 class ResearchAgent:
     def __init__(
         self,
         session: ResearchSession,
-        client: Any,
-        model: str,
+        provider: ChainedLLMProvider,
     ) -> None:
         self.session = session
-        self.client = client
-        self.model = model
+        self.provider = provider
         self.repo_root = session.repository.local_clone_path
         self.repo_url = session.repository.url
 
     def run(self) -> ResearchSession:
         start_time = time.monotonic()
-        tool_count = 0
         force_final = False
+        prior_findings = get_previous_findings(self.repo_url)
         messages = [
             {"role": "system", "content": self._system_prompt()},
-            {"role": "user", "content": self._initial_user_message()},
+            {
+                "role": "user",
+                "content": self._initial_user_message(prior_findings),
+            },
         ]
 
         self._mark_running()
 
         try:
             while True:
-                if self._budget_exhausted(start_time, tool_count):
+                if self._budget_exhausted(start_time):
                     messages.append({"role": "user", "content": self._budget_message()})
                     force_final = True
 
-                response = self._create_completion(messages, allow_tools=not force_final)
-                self._record_usage(response)
+                try:
+                    result = self._create_completion(messages, allow_tools=not force_final)
+                except ToolUseFailedError as exc:
+                    if force_final or not self._recover_failed_tool_generation(
+                        exc.failed_generation,
+                        messages,
+                        start_time,
+                    ):
+                        raise
+                    continue
 
-                message = response.choices[0].message
-                content = message.content or ""
-                tool_calls = getattr(message, "tool_calls", None) or []
+                self._record_usage(result)
 
-                if tool_calls and not force_final:
-                    assistant_message = self._assistant_message(message)
-                    messages.append(assistant_message)
+                if result.tool_calls and not force_final:
+                    messages.append(self._assistant_message(result))
 
-                    for tool_call in tool_calls:
-                        if self._budget_exhausted(start_time, tool_count):
+                    for tool_call in result.tool_calls:
+                        if self._budget_exhausted(start_time):
                             messages.append(self._budget_tool_result(tool_call))
                             continue
 
-                        tool_count += 1
+                        step_number = self._count_tool_calls() + 1
                         tool_input = self._tool_input(tool_call)
                         output, duration_ms = execute_tool(
-                            tool_name=tool_call.function.name,
+                            tool_name=tool_call.name,
                             tool_input=tool_input,
                             repo_root=self.repo_root,
                             session_id=self.session.id,
                         )
                         ToolCall.objects.create(
                             session=self.session,
-                            step_number=tool_count,
-                            tool_name=tool_call.function.name,
+                            step_number=step_number,
+                            tool_name=tool_call.name,
                             tool_input=tool_input,
                             tool_output=output,
                             duration_ms=duration_ms,
@@ -89,7 +101,29 @@ class ResearchAgent:
 
                     continue
 
-                self._mark_completed(content)
+                if (
+                    not force_final
+                    and result.content
+                    and self.session.findings.count() == 0
+                ):
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Before your final answer, call save_finding once "
+                                "for each file citation (file_path, line_start, "
+                                "line_end, and a short note). Then provide the "
+                                "final answer with inline citations."
+                            ),
+                        }
+                    )
+                    continue
+
+                final_answer = result.content
+                if self.provider.last_used_name:
+                    final_answer += f"\n\n_(LLM provider: {self.provider.last_used_name})_"
+                self._mark_completed(final_answer)
+                persist_citations_from_answer(self.session, result.content)
                 return self.session
         except Exception as exc:
             self._mark_failed(exc)
@@ -101,16 +135,82 @@ class ResearchAgent:
         self,
         messages: list[dict[str, Any]],
         allow_tools: bool,
-    ) -> Any:
-        kwargs: dict[str, Any] = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": 0.2,
-        }
-        if allow_tools:
-            kwargs["tools"] = groq_tools()
-            kwargs["tool_choice"] = "auto"
-        return self.client.chat.completions.create(**kwargs)
+    ) -> CompletionResult:
+        for attempt in range(MAX_COMPLETION_RETRIES + 1):
+            try:
+                return self.provider.create_completion(messages, allow_tools)
+            except ToolUseFailedError as exc:
+                if not allow_tools or attempt >= MAX_COMPLETION_RETRIES:
+                    raise
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Your last tool call was invalid. Use only the "
+                            "provided function-calling API. Do not emit "
+                            "<function=...> XML tags."
+                        ),
+                    }
+                )
+        raise RuntimeError("completion failed without a response")
+
+    def _recover_failed_tool_generation(
+        self,
+        failed_generation: str,
+        messages: list[dict[str, Any]],
+        start_time: float,
+    ) -> bool:
+        parsed = parse_failed_tool_from_text(failed_generation)
+        if parsed is None:
+            return False
+
+        tool_name, tool_input = parsed
+        if self._budget_exhausted(start_time):
+            return False
+
+        tool_call_id = f"recovered_{uuid.uuid4().hex[:12]}"
+        output, duration_ms = execute_tool(
+            tool_name=tool_name,
+            tool_input=tool_input,
+            repo_root=self.repo_root,
+            session_id=self.session.id,
+        )
+        step_number = self._count_tool_calls() + 1
+        ToolCall.objects.create(
+            session=self.session,
+            step_number=step_number,
+            tool_name=tool_name,
+            tool_input=tool_input,
+            tool_output=output,
+            duration_ms=duration_ms,
+        )
+        messages.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": tool_call_id,
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": json.dumps(tool_input),
+                        },
+                    }
+                ],
+            }
+        )
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": self._truncate_tool_result(output),
+            }
+        )
+        return True
+
+    def _count_tool_calls(self) -> int:
+        return self.session.tool_calls.count()
 
     def _mark_running(self) -> None:
         self.session.status = ResearchSession.Status.RUNNING
@@ -137,54 +237,45 @@ class ResearchAgent:
         self.session.completed_at = timezone.now()
         self.session.save(update_fields=["final_answer", "status", "completed_at"])
 
-    def _record_usage(self, response: Any) -> None:
-        usage = getattr(response, "usage", None)
-        if usage is None:
-            return
-
-        input_tokens = _usage_value(usage, "prompt_tokens", "input_tokens")
-        output_tokens = _usage_value(usage, "completion_tokens", "output_tokens")
-        if input_tokens or output_tokens:
-            self.session.input_tokens += input_tokens
-            self.session.output_tokens += output_tokens
+    def _record_usage(self, result: CompletionResult) -> None:
+        if result.input_tokens or result.output_tokens:
+            self.session.input_tokens += result.input_tokens
+            self.session.output_tokens += result.output_tokens
             self.session.save(update_fields=["input_tokens", "output_tokens"])
 
-    def _assistant_message(self, message: Any) -> dict[str, Any]:
+    def _assistant_message(self, result: CompletionResult) -> dict[str, Any]:
         assistant_message: dict[str, Any] = {
             "role": "assistant",
-            "content": message.content or "",
+            "content": result.content or "",
         }
-        tool_calls = []
-        for tool_call in getattr(message, "tool_calls", None) or []:
-            tool_calls.append(
+        if result.tool_calls:
+            assistant_message["tool_calls"] = [
                 {
                     "id": tool_call.id,
                     "type": "function",
                     "function": {
-                        "name": tool_call.function.name,
-                        "arguments": tool_call.function.arguments,
+                        "name": tool_call.name,
+                        "arguments": tool_call.arguments,
                     },
                 }
-            )
-        if tool_calls:
-            assistant_message["tool_calls"] = tool_calls
+                for tool_call in result.tool_calls
+            ]
         return assistant_message
 
-    def _tool_input(self, tool_call: Any) -> dict[str, Any]:
-        arguments = tool_call.function.arguments or "{}"
+    def _tool_input(self, tool_call: ToolCallRequest) -> dict[str, Any]:
         try:
-            parsed = json.loads(arguments)
+            parsed = json.loads(tool_call.arguments or "{}")
         except json.JSONDecodeError:
-            return {"_raw_arguments": arguments}
+            return {"_raw_arguments": tool_call.arguments}
         return parsed if isinstance(parsed, dict) else {"value": parsed}
 
-    def _budget_exhausted(self, start_time: float, tool_count: int) -> bool:
+    def _budget_exhausted(self, start_time: float) -> bool:
         return (
-            tool_count >= MAX_TOOL_CALLS
+            self._count_tool_calls() >= MAX_TOOL_CALLS
             or time.monotonic() - start_time >= MAX_WALL_CLOCK_SECONDS
         )
 
-    def _budget_tool_result(self, tool_call: Any) -> dict[str, str]:
+    def _budget_tool_result(self, tool_call: ToolCallRequest) -> dict[str, str]:
         return {
             "role": "tool",
             "tool_call_id": tool_call.id,
@@ -196,10 +287,20 @@ class ResearchAgent:
             return output
         return output[:MAX_TOOL_RESULT_CHARS] + "\n... [truncated]"
 
-    def _initial_user_message(self) -> str:
+    def _initial_user_message(self, prior_findings: list[dict[str, str]]) -> str:
+        prior_text = (
+            json.dumps(prior_findings, indent=2)
+            if prior_findings
+            else "[] (no prior findings for this repository)"
+        )
         return (
             f"Repository URL: {self.repo_url}\n"
-            f"Local clone path: {self.repo_root}\n\n"
+            f"Clone root on disk (for your reference only): {self.repo_root}\n\n"
+            f"IMPORTANT: All tool paths must be relative to the repository root. "
+            f"Use path '.' for the repo root (e.g. list_files with path '.'). "
+            f"Never use repo_cache, absolute paths, or the clone directory name.\n\n"
+            f"Prior findings (already loaded; do not call get_previous_findings):\n"
+            f"{prior_text}\n\n"
             f"Question: {self.session.question}"
         )
 
@@ -215,8 +316,10 @@ class ResearchAgent:
             "user's technical question by exploring the repository with tools and "
             "persisting important findings.\n\n"
             "Workflow requirements:\n"
-            "- First call get_previous_findings for the repository URL to check prior research.\n"
-            "- Explore strategically: start with list_files at the root, then drill into likely directories.\n"
+            "- Prior findings are already provided in the user message.\n"
+            "- Explore strategically: start with list_files(path='.'), then drill into subdirectories.\n"
+            "- Never pass repo_cache or absolute filesystem paths to tools.\n"
+            "- Use only the provided function-calling tools; never write <function=...> tags.\n"
             "- Use search_code for specific symbols, terms, routes, errors, and configuration names.\n"
             "- Use get_file_outline before reading large files.\n"
             "- Read only relevant files and line ranges; do not over-explore.\n"
@@ -224,25 +327,3 @@ class ResearchAgent:
             "- Final answers must cite file paths and line numbers inline.\n"
             "- Be concise and explain only what the question asks."
         )
-
-
-def groq_tools() -> list[dict[str, Any]]:
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": tool["name"],
-                "description": tool["description"],
-                "parameters": tool["input_schema"],
-            },
-        }
-        for tool in TOOLS
-    ]
-
-
-def _usage_value(usage: Any, *names: str) -> int:
-    for name in names:
-        value = getattr(usage, name, None)
-        if value is not None:
-            return int(value)
-    return 0

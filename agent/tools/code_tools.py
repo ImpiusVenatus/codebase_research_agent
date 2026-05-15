@@ -27,9 +27,10 @@ IGNORE_DIRS = {
 MAX_READ_LINES = 500
 MAX_READ_BYTES = 20 * 1024
 MAX_SEARCH_MATCHES = 50
+MAX_LIST_FILES = 80
 
 
-def list_files(repo_root: str, path: str = ".", max_depth: int = 2) -> list[str]:
+def list_files(repo_root: str, path: str = ".", max_depth: int = 1) -> list[str]:
     root = _safe_path(repo_root, path)
     if not root.exists():
         return [f"ERROR: path not found: {path}"]
@@ -49,6 +50,11 @@ def list_files(repo_root: str, path: str = ".", max_depth: int = 2) -> list[str]
 
         for filename in sorted(filenames):
             files.append(_relative_path(Path(repo_root), current_path / filename))
+
+    if len(files) > MAX_LIST_FILES:
+        extra = len(files) - MAX_LIST_FILES
+        files = files[:MAX_LIST_FILES]
+        files.append(f"... and {extra} more files (use a subdirectory path)")
 
     return files
 
